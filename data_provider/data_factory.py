@@ -1,0 +1,61 @@
+"""Shared fixed-split data loading and integrity checks for NeuroSigVIA baselines."""
+import contextlib
+import hashlib
+import io
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+from data_provider.data_loader import get_eeg_medformer_dataloaders, get_wearable_dataloaders
+
+ROOT=Path(__file__).resolve().parents[1]
+EEG_ROOT=Path(os.environ.get('NEUROSIGVIA_EEG_ROOT',ROOT/'data'/'eeg')).expanduser()
+WEARABLE_ROOT=Path(os.environ.get('NEUROSIGVIA_WEARABLE_ROOT',ROOT/'data'/'wearable')).expanduser()
+
+DATASETS={'adftd':('ADFTD','eeg',None,8),'tdbrain':('TDBRAIN','eeg',None,8),
+ 'apava':('APAVA','eeg',None,8),'shimmer10':('Shimmer_10_session10_AFC','wearable','shimmer_hc_vs_pd',1),
+ 'pads11':('PADS_11_task08_TouchIndex','wearable','pads_pd_vs_hc',4)}
+
+# 主方法与基线共用固定受试者划分；返回加载器和数据身份摘要。
+def load_data(key,smoke=False):
+    name,kind,mode,batch=DATASETS[key]
+    # 屏蔽底层加载提示，由调用方统一输出汇总信息。
+    with contextlib.redirect_stdout(io.StringIO()):
+        if kind=='eeg':
+            bundle=get_eeg_medformer_dataloaders(name,SimpleNamespace(data_dir=str(EEG_ROOT),batch_size=batch))
+        else:
+            bundle=get_wearable_dataloaders(name,SimpleNamespace(data_dir=str(WEARABLE_ROOT),batch_size=batch,wearable_label_mode=mode))
+    # 冒烟检查仅取每类前两个样本和前 256 点，不用于正式实验。
+    if smoke:
+        for split in ('train','vali','test'):
+            old=getattr(bundle,split+'_loader'); labels=getattr(bundle,split+'_labels')
+            indices=np.concatenate([np.flatnonzero(labels==c)[:2] for c in np.unique(labels)])
+            ds=TensorDataset(old.dataset.tensors[0][indices,:,:256])
+            ds.sample_subject_ids=np.asarray(old.dataset.sample_subject_ids)[indices]
+            ds.split_name=split
+            setattr(bundle,split+'_loader',DataLoader(ds,batch_size=2,shuffle=False,num_workers=0))
+            setattr(bundle,split+'_labels',np.asarray(labels)[indices])
+    manifest={}; idsets=[]
+    for split in ('train','vali','test'):
+        loader=getattr(bundle,split+'_loader'); labels=getattr(bundle,split+'_labels')
+        x=loader.dataset.tensors[0]; ids=np.asarray(loader.dataset.sample_subject_ids)
+        if len(x)!=len(labels) or len(ids)!=len(x): raise ValueError('Sample metadata mismatch')
+        # 连同标签、受试者编号按顺序计算摘要，识别数据内容或样本顺序变化。
+        h=hashlib.sha256()
+        for chunk in x.split(512):
+            if not bool(torch.isfinite(chunk).all()): raise ValueError('Non-finite source values')
+            h.update(chunk.numpy().tobytes())
+        h.update(np.asarray(labels,dtype=np.int64).tobytes())
+        h.update('\n'.join(map(str,ids)).encode())
+        idsets.append(set(ids.tolist()))
+        manifest[split]={'shape':list(x.shape),'classes':len(np.unique(labels)),
+                         'subjects':len(idsets[-1]),'data_label_order_sha256':h.hexdigest()}
+    # 划分单位是受试者；同一人的窗口不能同时进入不同集合。
+    overlap=[len(idsets[0]&idsets[1]),len(idsets[0]&idsets[2]),len(idsets[1]&idsets[2])]
+    if any(overlap): raise ValueError('Subject overlap')
+    manifest['subject_overlap']=overlap
+    return bundle,manifest
